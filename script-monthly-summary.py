@@ -1,178 +1,205 @@
-import smartsheet
-import pandas as pd
-from datetime import datetime
-from jinja2 import Environment
+#!/usr/bin/env python3
+"""
+Smartsheet → HTML + PDF + Excel summary hasta 2025-05-31
+• Excluye ciertos Stage Status
+• Selecciona filas en que NTP, Structure o Final estén entre 2024-10-23 y 2025-05-31 (OR)
+• Relocation/Repair: monto fijo $65 000 dividido 50/50/0
+• Reconstruction: lee montos reales de las columnas
+• Salidas:
+    – summary_temp_<YYYY-MM-DD>.html
+    – Smartsheet_Summary_until2025-05-31.pdf
+    – Smartsheet_Summary_until2025-05-31.xlsx
+"""
+
+import os, smartsheet, pandas as pd
+from datetime import datetime, date
 from weasyprint import HTML
+from pandas import ExcelWriter
+import openpyxl  # requerido por pandas
 
-# --- MONTH INPUT ---
-user_input = input("What month would you like to filter before? (Format: yyyy-mm): ")
-try:
-    datetime.strptime(user_input, "%Y-%m")
-    MONTH_FILTER = user_input
-except ValueError:
-    print("❌ Invalid format. Use yyyy-mm (e.g., 2025-06).")
-    exit(1)
+# Mostrar TODO en pandas si debugueas
+pd.set_option("display.max_rows", None)
+pd.set_option("display.max_columns", None)
 
-# --- CONFIGURATION ---
-API_TOKEN = "v6mG3HaOMr1VjYDdTAdvSyIUmTOK2F3SlBBiV"
-SHEET_ID = 5933665067421572
-TEMP_HTML = f"summary_temp_{MONTH_FILTER}.html"
-OUTPUT_PDF = f"Smartsheet_Summary_{MONTH_FILTER}.pdf"
-LOGO_PATH = "file:///C:/Users/lpagan.FR/OneDrive - FR Construction Group/Attachments/logo.png"
+# ─────────────────── CONFIG ───────────────────
+API_TOKEN = os.getenv("SMARTSHEET_ACCESS_TOKEN") or "v6mG3HaOMr1VjYDdTAdvSyIUmTOK2F3SlBBiV"
+SHEET_ID  = 5933665067421572
 
-# --- SMARTSHEET CONNECTION ---
+INICIO    = pd.to_datetime("2024-10-23")
+FIN       = pd.to_datetime("2025-05-31")
+HOY       = datetime.today().strftime("%Y-%m-%d")
+
+TMP_HTML  = f"summary_temp_{HOY}.html"
+OUT_PDF   = "Smartsheet_Summary_until2025-05-31.pdf"
+OUT_XLSX  = "Smartsheet_Summary_until2025-05-31.xlsx"
+LOGO_PATH = "fr_logo.png"
+
+
+# ─────────── CONECTAR Y BAJAR HASTA 10 000 FILAS ───────────
 client = smartsheet.Smartsheet(API_TOKEN)
-sheet = client.Sheets.get_sheet(SHEET_ID)
-columns = {col.title: col.id for col in sheet.columns}
+sheet  = client.Sheets.get_sheet(SHEET_ID, page_size=10000, page=1)
 
-# --- EXTRACT ROWS ---
-rows = []
-for row in sheet.rows:
-    row_data = {}
-    for cell in row.cells:
-        col_name = next((k for k, v in columns.items() if v == cell.column_id), None)
-        row_data[col_name] = cell.value
-    rows.append(row_data)
+col_map = {c.id: c.title.strip().replace("\n"," ") for c in sheet.columns}
+records = [
+    {col_map[cell.column_id]: cell.value for cell in row.cells}
+    for row in sheet.rows
+]
+df = pd.DataFrame(records)
+df.columns = [c.strip().replace("\n"," ") for c in df.columns]
 
-df = pd.DataFrame(rows)
 
-# --- HELPERS ---
-def is_before_month(date, target_month):
-    try:
-        return pd.to_datetime(date).strftime('%Y-%m') < target_month
-    except:
-        return False
+# ─────────── FUNCIONES AUXILIARES ───────────
+def parse_fecha(v):
+    if pd.isna(v): return pd.NaT
+    if isinstance(v, (datetime, pd.Timestamp, date)):
+        return pd.to_datetime(v)
+    for fmt in ("%m/%d/%y","%m/%d/%Y","%Y-%m-%d","%b/%d/%y","%d/%m/%Y"):
+        try:
+            return datetime.strptime(str(v), fmt)
+        except ValueError:
+            pass
+    return pd.to_datetime(v, errors="coerce")
 
-# --- FILTER CASES ---
-filtered_cases = []
+to_money = lambda x: float(pd.to_numeric(x, errors="coerce") or 0)
 
+
+# ─────────── FILTRAR Y CALCULAR ───────────
+EXCLUDE = {
+    "01 - Initial Scoping",
+    "03 - Design & Permitting",
+    "00 - Reassigned",
+    "02 - Pending Task Order",
+    "00 - Assigned Offline",
+    "16 - Inactive",
+}
+
+casos = []
 for _, row in df.iterrows():
-    award_type = str(row.get("Award Type Equivalent", "")).strip().lower()
+    status = str(row.get("Stage Status","")).strip()
+    if status in EXCLUDE:
+        continue
 
-    ntp_payment = 0
-    structure_payment = 0
-    final_payment = 0
+    f_ntp = parse_fecha(row.get("Date of Notice to Proceed"))
+    f_str = parse_fecha(row.get("Structure Inspection Passed"))
+    f_fin = parse_fecha(row.get("Final Inspection Passed"))
+    if pd.isna(f_fin):
+        f_fin = parse_fecha(row.get("Relo or Repair Final Inspection Passed"))
+
+    # OR entre las tres fechas
+    if not any([
+        pd.notna(f_ntp) and INICIO <= f_ntp <= FIN,
+        pd.notna(f_str) and INICIO <= f_str <= FIN,
+        pd.notna(f_fin) and INICIO <= f_fin <= FIN,
+    ]):
+        continue
+
+    tipo  = str(row.get("Award Type Equivalent","")).strip().lower()
+    pagos = {"ntp":0,"structure":0,"final":0}
+    fechas = {"ntp":"","structure":"","final":""}
     include = False
 
-    ntp_date = ""
-    structure_date = ""
-    final_date = ""
-
-    if award_type in ["relocation", "repair"]:
-        base_price = 65000
-
-        ntp_raw = row.get("Date of Notice to Proceed")
-        final_raw = row.get("Relo or Repair Final Inspection Passed")
-
-        if pd.notnull(ntp_raw) and is_before_month(ntp_raw, MONTH_FILTER):
-            ntp_payment = base_price * 0.5
-            ntp_date = ntp_raw
+    # Relocation/Repair: $65 000 split 50/50 (no Structure final)
+    if tipo in ("relocation","repair"):
+        base = 65000
+        if pd.notna(f_ntp) and INICIO <= f_ntp <= FIN:
+            pagos["ntp"]      = base*0.5
+            fechas["ntp"]     = f_ntp.date()
+            include = True
+        if pd.notna(f_str) and INICIO <= f_str <= FIN:
+            pagos["structure"]   = base*0.5
+            fechas["structure"] = f_str.date()
+            include = True
+        if pd.notna(f_fin) and INICIO <= f_fin <= FIN:
+            pagos["final"]    = base*0.5
+            fechas["final"]   = f_fin.date()
             include = True
 
-        if pd.notnull(final_raw) and is_before_month(final_raw, MONTH_FILTER):
-            final_payment = base_price * 0.5
-            final_date = final_raw
+    # Reconstruction: usa datos de columna real
+    elif tipo == "reconstruction":
+        if pd.notna(f_ntp) and INICIO <= f_ntp <= FIN:
+            pagos["ntp"]      = to_money(row.get("Payment Notice to Proceed"))
+            fechas["ntp"]     = f_ntp.date()
             include = True
-
-    elif award_type == "reconstruction":
-        ntp_raw = row.get("Date of Notice to Proceed")
-        structure_raw = row.get("Structure Inspection Passed")
-        final_raw = row.get("Final Inspection Passed")
-
-        if pd.notnull(ntp_raw) and is_before_month(ntp_raw, MONTH_FILTER):
-            ntp_payment = row.get("Payment Notice to Proceed") or 0
-            ntp_date = ntp_raw
+        if pd.notna(f_str) and INICIO <= f_str <= FIN:
+            pagos["structure"]   = to_money(row.get("Payment Structure"))
+            fechas["structure"] = f_str.date()
             include = True
-
-        if pd.notnull(structure_raw) and is_before_month(structure_raw, MONTH_FILTER):
-            structure_payment = row.get("Payment Structure") or 0
-            structure_date = structure_raw
-            include = True
-
-        if pd.notnull(final_raw) and is_before_month(final_raw, MONTH_FILTER):
-            final_payment = row.get("Payment Final") or 0
-            final_date = final_raw
+        if pd.notna(f_fin) and INICIO <= f_fin <= FIN:
+            pagos["final"]    = to_money(row.get("Payment Final"))
+            fechas["final"]   = f_fin.date()
             include = True
 
     if include:
-        case_info = {
-            "CaseID": row.get("Case ID"),
-            "Type": award_type.capitalize(),
-            "NTP": ntp_date,
-            "NTP_Payment": ntp_payment,
-            "Structure": structure_date,
-            "Structure_Payment": structure_payment,
-            "Final": final_date,
-            "Final_Payment": final_payment
-        }
-        filtered_cases.append(case_info)
+        casos.append({
+            "Case ID":          row.get("Case ID"),
+            "Type":             tipo.capitalize(),
+            "NTP Date":         fechas["ntp"],
+            "NTP $":            pagos["ntp"],
+            "Structure Date":   fechas["structure"],
+            "Structure $":      pagos["structure"],
+            "Final Date":       fechas["final"],
+            "Final $":          pagos["final"],
+            "Total Payments":   pagos["ntp"] + pagos["structure"] + pagos["final"],
+        })
 
-# --- SUMMARY ---
-date_based_summary = {
-    "NTP": sum(c["NTP_Payment"] for c in filtered_cases),
-    "Structure": sum(c["Structure_Payment"] for c in filtered_cases),
-    "Final": sum(c["Final_Payment"] for c in filtered_cases),
-    "Total": sum((c["NTP_Payment"] or 0) + (c["Structure_Payment"] or 0) + (c["Final_Payment"] or 0) for c in filtered_cases)
+
+# ─────────── TOTALES ───────────
+tot = {
+    "NTP":       sum(c["NTP $"] for c in casos),
+    "Structure": sum(c["Structure $"] for c in casos),
+    "Final":     sum(c["Final $"] for c in casos),
 }
+tot["Total"] = sum(tot.values())
 
-# --- HTML TEMPLATE ---
-html_template = """
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset=\"UTF-8\">
-    <title>Certification 2025-01</title>
-    <style>
-        body { font-family: Arial, sans-serif; font-size: 10px; }
-        table { border-collapse: collapse; width: 100%; font-size: 9px; }
-        th, td { border: 1px solid black; padding: 4px; text-align: center; }
-        h1, h2 { font-size: 12px; }
-    </style>
-</head>
-<body>
-<img src='""" + LOGO_PATH + """' style=\"width:150px; margin-bottom:10px;\">
-<h1>Certification No. 2025-01 – May 2025 – All certified cases up to May 31, 2025</h1>
 
-<h2>Individual Cases</h2>
+# ─────────── EXPORTAR EXCEL ───────────
+df_out = pd.DataFrame(casos)
+df_out.to_excel(OUT_XLSX, index=False)
+print(f"✅ Excel generado: {OUT_XLSX}")
+
+# ─────────── GENERAR PDF ───────────
+html_rows = "\n".join(
+    f"<tr>"
+    f"<td>{c['Case ID']}</td><td>{c['Type']}</td>"
+    f"<td>{c['NTP Date']}</td><td>${c['NTP $']:,.2f}</td>"
+    f"<td>{c['Structure Date']}</td><td>${c['Structure $']:,.2f}</td>"
+    f"<td>{c['Final Date']}</td><td>${c['Final $']:,.2f}</td>"
+    f"<td>${c['Total Payments']:,.2f}</td>"
+    f"</tr>"
+    for c in casos
+)
+
+html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>
+  thead{{display:table-header-group}} tr{{page-break-inside:avoid}}
+  @page{{size:A4;margin:10mm}}
+  body{{font-family:Arial;font-size:10px}}
+  table{{border-collapse:collapse;width:100%}}
+  th,td{{border:1px solid #000;padding:4px;text-align:center}}
+  h1,h2{{font-size:12px;margin:4px 0}}
+</style></head><body>
+<img src="{LOGO_PATH}" style="width:120px">
+<h1>Resumen hasta 2025-05-31 — {len(casos)} casos</h1>
 <table>
-    <thead>
-        <tr>
-            <th>Case ID</th><th>Type</th>
-            <th>NTP Date</th><th>NTP Payment</th>
-            <th>Structure Date</th><th>Structure Payment</th>
-            <th>Final Date</th><th>Final Payment</th>
-        </tr>
-    </thead>
-    <tbody>
-    {% for c in cases %}
-        <tr>
-            <td>{{ c.CaseID }}</td><td>{{ c.Type }}</td>
-            <td>{{ c.NTP }}</td><td>${{ "%.2f"|format(c.NTP_Payment or 0) }}</td>
-            <td>{{ c.Structure }}</td><td>${{ "%.2f"|format(c.Structure_Payment or 0) }}</td>
-            <td>{{ c.Final }}</td><td>${{ "%.2f"|format(c.Final_Payment or 0) }}</td>
-        </tr>
-    {% endfor %}
-    </tbody>
+  <thead><tr>
+    <th>Case ID</th><th>Type</th>
+    <th>NTP Date</th><th>NTP $</th>
+    <th>Structure Date</th><th>Structure $</th>
+    <th>Final Date</th><th>Final $</th>
+    <th>Total Payments</th>
+  </tr></thead>
+  <tbody>{html_rows}</tbody>
+  <tfoot><tr>
+    <td colspan="3"><strong>Totals:</strong></td>
+    <td><strong>${tot['NTP']:,.2f}</strong></td><td></td>
+    <td><strong>${tot['Structure']:,.2f}</strong></td><td></td>
+    <td><strong>${tot['Final']:,.2f}</strong></td>
+    <td><strong>${tot['Total']:,.2f}</strong></td>
+  </tr></tfoot>
 </table>
-<br>
-<h2>Summary Totals:</h2>
-<ul>
-    <li><strong>NTP:</strong> ${{ date_summary.NTP }}</li>
-    <li><strong>Structure:</strong> ${{ date_summary.Structure }}</li>
-    <li><strong>Final:</strong> ${{ date_summary.Final }}</li>
-    <li><strong style=\"color: green;\">Total:</strong> <strong>${{ date_summary.Total }}</strong></li>
-</ul>
-</body>
-</html>
-"""
+</body></html>"""
 
-# --- GENERATE PDF ---
-with open(TEMP_HTML, "w", encoding="utf-8") as f:
-    f.write(Environment().from_string(html_template).render(
-        month=MONTH_FILTER,
-        date_summary=date_based_summary,
-        cases=filtered_cases
-    ))
-
-HTML(TEMP_HTML).write_pdf(OUTPUT_PDF)
-print(f"✅ PDF successfully generated: {OUTPUT_PDF}")
+with open(TMP_HTML, "w", encoding="utf-8") as f:
+    f.write(html)
+HTML(TMP_HTML).write_pdf(OUT_PDF)
+print(f"✅ PDF generado: {OUT_PDF}")
