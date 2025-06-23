@@ -62,6 +62,18 @@ def parse_fecha(v):
 
 to_money = lambda x: float(pd.to_numeric(x, errors="coerce") or 0)
 
+# Detect the "Structure Inspection" column even if the exact name varies
+def find_column(df, keywords):
+    for col in df.columns:
+        cl = col.lower()
+        if all(k.lower() in cl for k in keywords):
+            return col
+    return None
+
+STRUCT_COL = find_column(df, ["structure", "inspection", "passed"])
+if not STRUCT_COL:
+    raise ValueError("No column found for Structure Inspection")
+
 
 # ─────────── FILTRAR Y CALCULAR ───────────
 EXCLUDE = {
@@ -81,6 +93,7 @@ for _, row in df.iterrows():
 
     f_ntp = parse_fecha(row.get("Date of Notice to Proceed"))
     f_str = parse_fecha(row.get("Structure Inspection Passed"))
+    f_str = parse_fecha(row.get(STRUCT_COL))
     f_fin = parse_fecha(row.get("Final Inspection Passed"))
     if pd.isna(f_fin):
         f_fin = parse_fecha(row.get("Relo or Repair Final Inspection Passed"))
